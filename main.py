@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,7 +9,6 @@ from openai import OpenAI
 
 app = FastAPI(title="YouTube Bias Detector API (Groq)")
 
-# Разрешаем запросы из браузерного расширения (CORS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,76 +27,41 @@ client = OpenAI(
 
 class AnalyzeRequest(BaseModel):
     video_id: str
+    transcript_text: Optional[str] = None  # Принимаем текст субтитров напрямую от браузера
 
 
-def get_youtube_transcript_raw(video_id: str):
-    """Безопасный забор субтитров с сохранением таймкодов"""
+def get_youtube_transcript_fallback(video_id: str) -> str:
+    """Резервное извлечение субтитров на сервере (если клиент не прислал текст)"""
     try:
         data = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'ru-RU', 'en', 'en-US'])
-        if data:
-            return data
-    except Exception:
-        pass
-
-    try:
-        if hasattr(YouTubeTranscriptApi, 'list_transcripts'):
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        else:
-            transcript_list = YouTubeTranscriptApi().list(video_id)
-
-        try:
-            transcript = transcript_list.find_transcript(['ru', 'en'])
-        except Exception:
-            first_available = list(transcript_list)[0]
-            transcript = first_available.translate('ru')
-
-        data = transcript.fetch()
-        if data:
-            return data
-
-    except Exception as e:
-        print(f"Ошибка получения субтитров: {e}")
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Не удалось извлечь субтитры из данного видео: {str(e)}"
-        )
-
-    raise HTTPException(status_code=400, detail="Субтитры пустые или недоступны.")
-
-
-def format_transcript_with_timestamps(data) -> str:
-    """Форматирует субтитры с указанием секунд для ИИ"""
-    formatted_lines = []
-    total_length = 0
-    max_chars = 15000
-
-    for item in data:
-        # Извлекаем текст
-        if isinstance(item, dict):
-            text = item.get('text', '')
+        formatted_lines = []
+        for item in data:
             start = int(item.get('start', 0))
-        else:
-            text = getattr(item, 'text', str(item))
-            start = int(getattr(item, 'start', 0))
-
-        line = f"[{start}s] {text}"
-        if total_length + len(line) > max_chars:
-            break
-        formatted_lines.append(line)
-        total_length += len(line)
-
-    return "\n".join(formatted_lines)
+            text = item.get('text', '')
+            formatted_lines.append(f"[{start}s] {text}")
+        return "\n".join(formatted_lines)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не удалось получить субтитры на сервере (IP заблокирован YouTube): {str(e)}"
+        )
 
 
 @app.post("/api/analyze")
 async def analyze_video(request: AnalyzeRequest):
     video_id = request.video_id
     
-    # 1. Получаем raw-субтитры с временными метками
-    transcript_data = get_youtube_transcript_raw(video_id)
-    formatted_transcript = format_transcript_with_timestamps(transcript_data)
+    # 1. Используем текст от расширения или делаем fallback-запрос
+    if request.transcript_text and request.transcript_text.strip():
+        formatted_transcript = request.transcript_text
+    else:
+        formatted_transcript = get_youtube_transcript_fallback(video_id)
 
-    # 2. Промпт для ИИ с расширенными полями
+    # Ограничение по длине текста (~15 000 символов)
+    max_chars = 15000
+    if len(formatted_transcript) > max_chars:
+        formatted_transcript = formatted_transcript[:max_chars] + "..."
+
     system_prompt = """
     Ты — эксперт по когнитивной психологии, критическому мышлению и логике.
     Твоя задача — проанализировать предоставленный транскрипт видео с таймкодами вида [Xs] и найти в нём когнитивные ошибки (искажения), манипуляции или логические неувязки.
@@ -104,13 +69,13 @@ async def analyze_video(request: AnalyzeRequest):
     Отвечай строго в формате JSON следующей структуры:
     {
       "summary": "Краткое резюме об общем качестве аргументации в видео (1-2 предложения).",
-      "credibility_score": 75, // Число от 0 до 100 (индекс аргументированности, где 100 - идеальная аргументация без ошибок)
+      "credibility_score": 75,
       "biases": [
         {
           "name": "Название когнитивной ошибки/манипуляции (на русском)",
           "category": "Логическая ошибка" | "Эмоциональная манипуляция" | "Фальшивые факты" | "Подмена понятий",
           "quote": "Цитата из видео",
-          "timestamp": 125, // Секунда, на которой это сказано (число из скобок [Xs])
+          "timestamp": 125,
           "explanation": "Подробное объяснение, почему это является ошибкой мышления в данном контексте"
         }
       ]
@@ -131,7 +96,6 @@ async def analyze_video(request: AnalyzeRequest):
             temperature=0.2
         )
         
-        # Парсим строка в JSON для уверенности в структуре ответа
         res_content = response.choices[0].message.content
         return json.loads(res_content)
 
@@ -141,4 +105,4 @@ async def analyze_video(request: AnalyzeRequest):
 
 @app.get("/")
 def read_root():
-    return {"status": "Server is running (Groq Backend v2)"}
+    return {"status": "Server is running (Client-side transcript support)"}
