@@ -17,23 +17,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+# 1. Загружаем API-ключ строго из переменных окружения
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    console.warn("⚠️ Переменная GROQ_API_KEY не задана в окружении!")
 
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY,
+    api_key=GROQ_API_KEY or "fallback_key_if_needed",
 )
 
 
 class AnalyzeRequest(BaseModel):
     video_id: str
-    transcript_text: Optional[str] = None  # Принимаем текст субтитров напрямую от браузера
+    transcript_text: Optional[str] = None  # Текст субтитров напрямую от расширения
 
 
 def get_youtube_transcript_fallback(video_id: str) -> str:
-    """Резервное извлечение субтитров на сервере (если клиент не прислал текст)"""
+    """Резервное извлечение субтитров на сервере с поддержкой прокси"""
+    proxy_url = os.getenv("YOUTUBE_PROXY_URL")
+    proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+
     try:
-        data = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'ru-RU', 'en', 'en-US'])
+        # 2. Безопасное получение субтитров без использования cookies (с прокси, если задан)
+        data = YouTubeTranscriptApi.get_transcript(
+            video_id, 
+            languages=['ru', 'ru-RU', 'en', 'en-US'],
+            proxies=proxies
+        )
         formatted_lines = []
         for item in data:
             start = int(item.get('start', 0))
@@ -43,7 +55,7 @@ def get_youtube_transcript_fallback(video_id: str) -> str:
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Не удалось получить субтитры на сервере (IP заблокирован YouTube): {str(e)}"
+            detail=f"Не удалось получить субтитры на сервере: {str(e)}"
         )
 
 
@@ -51,13 +63,13 @@ def get_youtube_transcript_fallback(video_id: str) -> str:
 async def analyze_video(request: AnalyzeRequest):
     video_id = request.video_id
     
-    # 1. Используем текст от расширения или делаем fallback-запрос
+    # Использование субтитров от клиента или fallback-запроса
     if request.transcript_text and request.transcript_text.strip():
         formatted_transcript = request.transcript_text
     else:
         formatted_transcript = get_youtube_transcript_fallback(video_id)
 
-    # Ограничение по длине текста (~15 000 символов)
+    # Ограничение длины текста
     max_chars = 15000
     if len(formatted_transcript) > max_chars:
         formatted_transcript = formatted_transcript[:max_chars] + "..."
