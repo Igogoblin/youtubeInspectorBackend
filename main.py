@@ -37,21 +37,36 @@ class AnalyzeRequest(BaseModel):
 def get_youtube_transcript_fallback(video_id: str) -> str:
     """Резервное извлечение субтитров на сервере с поддержкой прокси"""
     proxy_url = os.getenv("YOUTUBE_PROXY_URL")
-    proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+    languages = ['ru', 'ru-RU', 'en', 'en-US']
 
     try:
-        # 2. Безопасное получение субтитров без использования cookies (с прокси, если задан)
-        data = YouTubeTranscriptApi.get_transcript(
-            video_id, 
-            languages=['ru', 'ru-RU', 'en', 'en-US'],
-            proxies=proxies
-        )
+        data = None
+
+        # 1. Попытка вызова через новый API (Экземпляр класса)
+        try:
+            api = YouTubeTranscriptApi()
+            # В новых версиях методы вызываются у экземпляра
+            data = api.get_transcript(video_id, languages=languages)
+        except AttributeError:
+            # 2. Старый формат (Статический метод класса)
+            proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+            data = YouTubeTranscriptApi.get_transcript(
+                video_id, 
+                languages=languages,
+                proxies=proxies
+            )
+
+        if not data:
+            raise ValueError("Субтитры вернули пустой результат")
+
         formatted_lines = []
         for item in data:
             start = int(item.get('start', 0))
             text = item.get('text', '')
             formatted_lines.append(f"[{start}s] {text}")
+
         return "\n".join(formatted_lines)
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
